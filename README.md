@@ -1,8 +1,8 @@
-# Token Radar — Raphael's entry (model v3)
+# Token Radar — Raphael's entry (model v4)
 
 [![make.fun · token-radar-01](https://make.fun/badge/token-radar-01.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
-[![rank](https://make.fun/badge/token-radar-01/Alcyone-9/token-radar-01-v3/rank.svg)](https://make.fun/bounty/token-radar-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
-[![reward](https://make.fun/badge/token-radar-01/Alcyone-9/token-radar-01-v3/reward.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
+[![rank](https://make.fun/badge/token-radar-01/Alcyone-9/token-radar-01-v4/rank.svg)](https://make.fun/bounty/token-radar-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
+[![reward](https://make.fun/badge/token-radar-01/Alcyone-9/token-radar-01-v4/reward.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 
 A radar for protocols that have not launched a token yet — and only those. Every protocol
 in the sealed snapshot is accounted for, in three sets that are told apart before anything
@@ -25,6 +25,31 @@ is priced:
   thing.
 
 198 + 416 + 144 = 758: the whole snapshot, nothing dropped silently.
+
+## What changed in v4
+
+Version 3 fitted one multiple per category — which prices a $5M lending market and a
+$5B one at the same multiple. The snapshot's own peers say size is systematic: across
+the 128 tokened peers that carry both a market cap and a TVL, the log multiple falls
+with log TVL at a slope of ≈ −0.45 (correlation −0.42). Version 4 fits the size curve
+as well as the category:
+
+- Each category keeps its own log-intercept, but all intercepts sit on **one global
+  size curve** — `multiple = exp(intercept_category) × TVL^(slope)` — fitted jointly
+  over the peer pool, winsorized and clamped exactly as in v3.
+- The slope is not free to chase noise: it is ridge-shrunk (λ), and both the shrinkage
+  k and the ridge λ are chosen by the same two-way holdout as v3, now over a
+  k × λ grid (k ∈ {2, 4, 6, 10, 16, 24, 40}, λ ∈ {0, 8, 32}). The winner is
+  **k = 16, λ = 8**.
+- The pooled median held-out |log error| falls from v3's **1.5947 to 1.1971** — the
+  typical launch now lands ×3.3 from its fitted value instead of ×4.9. The full grid,
+  both error directions and the range band are published in the Model test panel, as
+  before.
+
+Everything else carries over unchanged: the 198 / 416 / 144 separation, the cohort
+launch odds and expected values, the farm verdicts, and the holdout-calibrated ranges.
+The fit still rests on the same 128 of 416 tokened peers — v4 widened the model, not
+the evidence, and says so.
 
 ## What changed in v3
 
@@ -135,9 +160,11 @@ the published test figures exactly.
 The screenshots are real renders of this page (headless Chrome over the built output):
 the board with its KPI strip and Model test panel, the top-ranked protocol's detail view,
 and the Lending category filtered by momentum. They are palette-quantized to 160 colours
-at full 1440px resolution (PSNR ≈ 40 dB against the raw renders; palette quantization
+at full 1440px resolution (PSNR 40–42 dB against the raw renders; palette quantization
 keeps text edges hard, unlike JPEG) — the dossier is a tie-break, so it travels light:
-458,152 bytes against v2's 1,187,117.
+552,780 bytes against v2's 1,187,117. That is heavier than v3's 458,152 — the v4 board
+renders denser panels — and the trade was made deliberately: model accuracy first,
+tie-break bytes second.
 
 ## Run
 
