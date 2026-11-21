@@ -1,11 +1,12 @@
-// Token Radar v3 — Raphael's dashboard. Reads window.RADAR (written beside dashboard/ by
+// Token Radar v4 — Raphael's dashboard. Reads window.RADAR (written beside dashboard/ by
 // main.ts) and renders three views — the ranked board, the live tokens, the set-aside
 // products — plus a detail view per protocol. No network: every byte shown is in data.js.
 //
 // The page runs the whole model itself: the fit (fitModel), the two-way holdout that chose
-// its shrinkage (holdoutTest), the cohort odds (launchOdds), the verdicts (verdictFor) and
-// the plan generator are lib/model.ts restated — every row's value, range, odds, expected
-// value, verdict and farm plan is regenerated here and marked where it matches board.json.
+// its shrinkage and slope ridge (holdoutTest), the cohort odds (launchOdds), the verdicts
+// (verdictFor) and the plan generator are lib/model.ts restated — every row's value, range,
+// odds, expected value, verdict and farm plan is regenerated here and marked where it
+// matches board.json.
 (function () {
   'use strict';
   var D = typeof window !== 'undefined' ? window.RADAR : null;
@@ -33,31 +34,51 @@
   }
   var PRODUCT_CATEGORIES = { 'Bridge': 1, 'Canonical Bridge': 1, 'Liquid Staking': 1, 'Liquid Restaking': 1, 'Restaked BTC': 1, 'CEX': 1 };
   var FIT_GRID_K = [2, 4, 6, 10, 16, 24, 40];
+  var FIT_GRID_LAMBDA = [0, 8, 32];
+  var SIZE_FIT_ITERATIONS = 25;
 
-  /* — the fit, restated: log-space category multiples pulled toward the global fit — */
+  /* — the fit, restated: per-category log-intercepts on one global size curve, fitted together — */
 
-  function fitOn(pool, winsorCap, k) {
+  function fitOn(pool, winsorCap, k, lambda) {
     var M = D.model;
-    function clampM(n) { return Math.min(M.clamp_hi, Math.max(M.clamp_lo, n)); }
-    var globalLogs = [];
-    var byCategory = {};
-    pool.forEach(function (x) {
-      var logRatio = Math.log(Math.min(x.ratio, winsorCap));
-      if (!PRODUCT_CATEGORIES[x.category]) globalLogs.push(logRatio);
-      if (!byCategory[x.category]) byCategory[x.category] = [];
-      byCategory[x.category].push(logRatio);
-    });
-    var globalLog = globalLogs.length > 0 ? globalLogs.reduce(function (s, v) { return s + v; }, 0) / globalLogs.length : Math.log(0.2);
-    var fitted = {};
-    Object.keys(byCategory).forEach(function (category) {
-      var logs = byCategory[category];
-      var mean = logs.reduce(function (s, v) { return s + v; }, 0) / logs.length;
-      fitted[category] = clampM(Math.exp((logs.length * mean + k * globalLog) / (logs.length + k)));
-    });
-    return { global: clampM(Math.exp(globalLog)), byCategory: fitted };
+    var center = pool.length > 0 ? pool.reduce(function (s, x) { return s + Math.log(x.tvl); }, 0) / pool.length : 0;
+    function logRatio(x) { return Math.log(Math.min(x.ratio, winsorCap)); }
+    var slope = 0, globalLog = Math.log(0.2), byCategory = {};
+    for (var it = 0; it < SIZE_FIT_ITERATIONS; it++) {
+      var globalLogs = [];
+      var byCat = {};
+      pool.forEach(function (x) {
+        var adj = logRatio(x) - slope * (Math.log(x.tvl) - center);
+        if (!PRODUCT_CATEGORIES[x.category]) globalLogs.push(adj);
+        if (!byCat[x.category]) byCat[x.category] = [];
+        byCat[x.category].push(adj);
+      });
+      globalLog = globalLogs.length > 0 ? globalLogs.reduce(function (s, v) { return s + v; }, 0) / globalLogs.length : Math.log(0.2);
+      byCategory = {};
+      Object.keys(byCat).forEach(function (category) {
+        var logs = byCat[category];
+        var mean = logs.reduce(function (s, v) { return s + v; }, 0) / logs.length;
+        byCategory[category] = (logs.length * mean + k * globalLog) / (logs.length + k);
+      });
+      var num = 0, den = lambda;
+      pool.forEach(function (x) {
+        var z = Math.log(x.tvl) - center;
+        var a = Object.prototype.hasOwnProperty.call(byCategory, x.category) ? byCategory[x.category] : globalLog;
+        num += z * (logRatio(x) - a);
+        den += z * z;
+      });
+      slope = den > 0 ? num / den : 0;
+    }
+    return { globalLog: globalLog, byCategory: byCategory, slope: slope, center: center };
   }
-  function predict(fit, category) {
-    return Object.prototype.hasOwnProperty.call(fit.byCategory, category) ? fit.byCategory[category] : fit.global;
+  function predictLogAtZ(fit, category, z) {
+    var a = Object.prototype.hasOwnProperty.call(fit.byCategory, category) ? fit.byCategory[category] : fit.globalLog;
+    return a + fit.slope * (z - fit.center);
+  }
+  function predict(fit, x) {
+    var M = D.model;
+    var v = Math.exp(predictLogAtZ(fit, x.category, Math.log(x.tvl)));
+    return Math.min(M.clamp_hi, Math.max(M.clamp_lo, v));
   }
 
   /** The two-way holdout, run in the page on the published peer pool. */
@@ -68,28 +89,37 @@
     var winsorCap = ratios.length > 0 ? quantile(ratios, M.winsor_p) : 1;
     var halfA = pool.filter(function (x) { return slugHash(x.slug) % 2 === 0; });
     var halfB = pool.filter(function (x) { return slugHash(x.slug) % 2 === 1; });
-    function residualsFor(k) {
-      var fitA = fitOn(halfA, winsorCap, k);
-      var fitB = fitOn(halfB, winsorCap, k);
-      var ab = halfB.map(function (x) { return Math.log(Math.min(x.ratio, winsorCap)) - Math.log(predict(fitA, x.category)); });
-      var ba = halfA.map(function (x) { return Math.log(Math.min(x.ratio, winsorCap)) - Math.log(predict(fitB, x.category)); });
+    function residualsFor(k, lambda) {
+      var fitA = fitOn(halfA, winsorCap, k, lambda);
+      var fitB = fitOn(halfB, winsorCap, k, lambda);
+      var ab = halfB.map(function (x) { return Math.log(Math.min(x.ratio, winsorCap)) - Math.log(predict(fitA, x)); });
+      var ba = halfA.map(function (x) { return Math.log(Math.min(x.ratio, winsorCap)) - Math.log(predict(fitB, x)); });
       return { ab: ab, ba: ba };
     }
-    var bestK = FIT_GRID_K[0], bestError = Infinity, grid = [];
+    var bestK = FIT_GRID_K[0], bestLambda = FIT_GRID_LAMBDA[0], bestError = Infinity, grid = [];
     FIT_GRID_K.forEach(function (k) {
-      var r = residualsFor(k);
-      var error = median(r.ab.concat(r.ba).map(Math.abs));
-      grid.push({ k: k, error: r4(error) });
-      if (error < bestError) { bestError = error; bestK = k; }
+      FIT_GRID_LAMBDA.forEach(function (lambda) {
+        var r = residualsFor(k, lambda);
+        var error = median(r.ab.concat(r.ba).map(Math.abs));
+        grid.push({ k: k, lambda: lambda, error: r4(error) });
+        if (error < bestError) { bestError = error; bestK = k; bestLambda = lambda; }
+      });
     });
-    var win = residualsFor(bestK);
+    var win = residualsFor(bestK, bestLambda);
     var absPooled = win.ab.concat(win.ba).map(Math.abs);
-    var fitA = fitOn(halfA, winsorCap, bestK);
-    var fitB = fitOn(halfB, winsorCap, bestK);
+    var fitA = fitOn(halfA, winsorCap, bestK, bestLambda);
+    var fitB = fitOn(halfB, winsorCap, bestK, bestLambda);
+    var sums = {};
+    pool.forEach(function (x) {
+      if (!sums[x.category]) sums[x.category] = { sum: 0, n: 0 };
+      sums[x.category].sum += Math.log(x.tvl);
+      sums[x.category].n += 1;
+    });
     var stability = [];
     Object.keys(fitA.byCategory).forEach(function (category) {
       if (Object.prototype.hasOwnProperty.call(fitB.byCategory, category)) {
-        stability.push(Math.abs(Math.log(fitA.byCategory[category]) - Math.log(fitB.byCategory[category])));
+        var z = sums[category] ? sums[category].sum / sums[category].n : fitA.center;
+        stability.push(Math.abs(predictLogAtZ(fitA, category, z) - predictLogAtZ(fitB, category, z)));
       }
     });
     var bandSource = stability.length > 0 ? stability : sortedCopy(absPooled);
@@ -97,6 +127,7 @@
     var covered = bandSource.filter(function (v) { return v <= band; }).length;
     return {
       fit_k: bestK,
+      fit_lambda: bestLambda,
       peers: pool.length,
       grid: grid,
       err_fit_a_test_b: r4(median(win.ab.map(Math.abs))),
@@ -109,35 +140,31 @@
     };
   }
 
-  /** The fitted multiples for every category, from the page's own holdout-chosen k. */
+  /** The fitted curves for every category, from the page's own holdout-chosen (k, lambda). */
   function fitModel() {
     var test = holdoutTest();
     var pool = D.peer_pool;
-    var fit = fitOn(pool, test.winsor_cap, test.fit_k);
+    var fit = fitOn(pool, test.winsor_cap, test.fit_k, test.fit_lambda);
     var M = D.model;
     function clampM(n) { return Math.min(M.clamp_hi, Math.max(M.clamp_lo, n)); }
     var band = test.band_half_width;
+    var globalLogIntercept = r4(fit.globalLog);
     var out = {};
     D.multiples.forEach(function (cm) { out[cm.category] = cm; });
     var fitted = {};
     Object.keys(out).forEach(function (category) {
       var cm = out[category];
-      if (cm.sample === 0) {
-        fitted[category] = {
-          multiple: r4(fit.global),
-          multiple_low: r4(clampM(fit.global * Math.exp(-band))),
-          multiple_high: r4(clampM(fit.global * Math.exp(band)))
-        };
-      } else {
-        var m = Object.prototype.hasOwnProperty.call(fit.byCategory, category) ? fit.byCategory[category] : fit.global;
-        fitted[category] = {
-          multiple: r4(m),
-          multiple_low: r4(clampM(Math.min(m, m * Math.exp(-band)))),
-          multiple_high: r4(clampM(Math.max(m, m * Math.exp(band))))
-        };
-      }
+      var logIntercept = cm.sample === 0 ? globalLogIntercept
+        : r4(Object.prototype.hasOwnProperty.call(fit.byCategory, category) ? fit.byCategory[category] : fit.globalLog);
+      var m = clampM(Math.exp(logIntercept));
+      fitted[category] = {
+        log_intercept: logIntercept,
+        multiple: r4(m),
+        multiple_low: r4(clampM(Math.min(m, m * Math.exp(-band)))),
+        multiple_high: r4(clampM(Math.max(m, m * Math.exp(band))))
+      };
     });
-    return { test: test, global: r4(fit.global), multiples: fitted };
+    return { test: test, global: r4(clampM(Math.exp(globalLogIntercept))), slope: r4(fit.slope), center: r4(fit.center), multiples: fitted };
   }
 
   /* — the odds, restated: a cohort's own launch record — */
@@ -274,6 +301,7 @@
     var M = D.model;
     var cm = multMap[r.category || ''];
     if (!cm) return null;
+    function clampM(n) { return Math.min(M.clamp_hi, Math.max(M.clamp_lo, n)); }
     var g = r.change_7d === null || r.change_7d === undefined ? 0 : r.change_7d;
     g = Math.min(M.momentum_cap, Math.max(M.momentum_floor, g));
     var mom = r4(1 + (g / 100) * M.momentum_weight);
@@ -281,12 +309,14 @@
     var mat = r4(M.maturity_floor + (Math.min(Math.max(age, 0), M.maturity_days) / M.maturity_days) * M.maturity_range);
     var ch = r.chains.length >= 3 ? M.chain_3plus : r.chains.length === 2 ? M.chain_2 : 1;
     function at(m) { return Math.max(1, Math.round(r.tvl_usd * m * mom * mat * ch)); }
-    var implied = at(cm.multiple);
+    var band = D.model_test.band_half_width;
+    var mRow = clampM(Math.exp(cm.log_intercept + D.size_slope * (Math.log(r.tvl_usd) - D.size_center)));
+    var implied = at(mRow);
     var cohort = launchOdds(r);
     var odds = cohort ? cohort.odds : 0;
     var expected = Math.round(implied * odds);
     return {
-      implied: implied, low: at(cm.multiple_low), high: at(cm.multiple_high),
+      implied: implied, low: at(clampM(mRow * Math.exp(-band))), high: at(clampM(mRow * Math.exp(band))),
       mom: mom, mat: mat, ch: ch, odds: odds, expected: expected,
       verdict: verdictFor(expected, odds)
     };
@@ -389,7 +419,7 @@
       '<div class="stats kpi">' +
       '<div class="stat"><div class="num green">' + covered + '/' + D.watchlist_size + '</div><div class="lbl">watchlist protocols on the board — coverage is the floor, never the ceiling</div></div>' +
       '<div class="stat"><div class="num">' + total + '</div><div class="lbl">protocols accounted for: ' + D.board_size + ' ranked + ' + D.live_total + ' tokened + ' + D.aside_size + ' products, none dropped</div></div>' +
-      '<div class="stat"><div class="num violet">×' + miss.toFixed(1) + '</div><div class="lbl">median held-out miss of the fitted model — two-way holdout on ' + D.model_test.peers + ' tokened peers, k = ' + D.model_test.fit_k + ' chosen by the test</div></div>' +
+      '<div class="stat"><div class="num violet">×' + miss.toFixed(1) + '</div><div class="lbl">median held-out miss of the fitted model — two-way holdout on ' + D.model_test.peers + ' tokened peers, k = ' + D.model_test.fit_k + ' and λ = ' + D.model_test.fit_lambda + ' chosen by the test</div></div>' +
       '<div class="stat"><div class="num amber">' + counts.farm + ' / ' + counts.thin + ' / ' + counts.skip + '</div><div class="lbl">farm / thin / skip — every one of the ' + D.board_size + ' costed farm plans netted to a verdict</div></div>' +
       '<div class="stat"><div class="num">' + agrees + '/' + D.board_size + '</div><div class="lbl">rows this page recomputed — value, range, odds, verdict and plan — and matched board.json exactly</div></div>' +
       '</div>';
@@ -418,8 +448,8 @@
     }).join(' · ');
     return '' +
       '<section class="model-strip"><h2>How a value is implied</h2>' +
-      '<div class="formula">implied <span class="op">=</span> TVL <span class="op">×</span> fitted category multiple <span class="op">×</span> momentum <span class="op">×</span> maturity <span class="op">×</span> reach &nbsp;·&nbsp; expected <span class="op">=</span> implied <span class="op">×</span> launch odds</div>' +
-      '<p>The <b>category multiple</b> is <b>fitted</b>, not looked up: in log space, each category\'s tokened peers pull the multiple toward their own mean ratio, the global fit pulls back with strength <b>k = ' + D.model_test.fit_k + '</b> — the k the holdout below chose. Peer ratios are <b>winsorized at ×' + D.winsor_cap.toFixed(2) + '</b> first, so one absurd peer cannot carry a category; every fit is clamped to [0.02, 5]. The <b>range</b> is the fit widened by the model\'s own measured split-half error band (×' + Math.exp(D.model_test.band_half_width).toFixed(2) + '), not a decoration.</p>' +
+      '<div class="formula">implied <span class="op">=</span> TVL <span class="op">×</span> fitted multiple at that size <span class="op">×</span> momentum <span class="op">×</span> maturity <span class="op">×</span> reach &nbsp;·&nbsp; expected <span class="op">=</span> implied <span class="op">×</span> launch odds</div>' +
+      '<p>The <b>multiple</b> is <b>fitted</b>, not looked up: each category has a log-intercept fitted from its own tokened peers, pulled toward the global fit with strength <b>k = ' + D.model_test.fit_k + '</b>, and one <b>size slope</b> is fitted over all of them — log multiple changes by <b>' + D.size_slope.toFixed(4) + '</b> for each e-fold of TVL away from the peers\' centre size (' + fmtUsd(Math.exp(D.size_center)) + '), so a protocol ten times the size carries ×' + Math.exp(D.size_slope * Math.log(10)).toFixed(2) + ' the multiple. The slope is ridge-pulled with <b>λ = ' + D.model_test.fit_lambda + '</b>; (k, λ) are the pair the holdout below chose. Peer ratios are <b>winsorized at ×' + D.winsor_cap.toFixed(2) + '</b> first, so one absurd peer cannot carry a category; every fit is clamped to [0.02, 5]. The <b>range</b> is the fit widened by the model\'s own measured split-half error band (×' + Math.exp(D.model_test.band_half_width).toFixed(2) + '), not a decoration.</p>' +
       '<p><b>Launch odds</b> are the launch record of the protocol\'s own cohort — same category, age band and TVL band: of the snapshot\'s protocols alike in those three, the share that ever recorded a token, smoothed toward the field rate (' + Math.round(D.global_tokened_rate * 100) + '%). <b>Expected value</b> is implied × odds, shown beside implied, never instead of it: the board ranks by implied, and the odds say how much of it to believe in. Each farm plan is then <b>netted to a verdict</b> — farm, thin or skip — from its expected value against the snapshot\'s own floor and its cohort\'s odds. The letter grades the peer evidence behind the multiple (A deep · B solid · C thin · D global fallback); the <b>✓</b> means this page regenerated the row itself — value, range, odds, verdict, all farm steps — and matched.</p>' +
       '<p>' + chips + '</p></section>';
   }
@@ -432,21 +462,28 @@
     var match = false;
     if (mine) {
       var t = mine.test;
-      match = t.fit_k === T.fit_k && t.err_fit_a_test_b === T.err_fit_a_test_b && t.err_fit_b_test_a === T.err_fit_b_test_a &&
+      match = t.fit_k === T.fit_k && t.fit_lambda === T.fit_lambda && t.err_fit_a_test_b === T.err_fit_a_test_b && t.err_fit_b_test_a === T.err_fit_b_test_a &&
         t.median_abs_log_error === T.median_abs_log_error && t.band_half_width === T.band_half_width &&
-        t.band_coverage === T.band_coverage && t.band_pairs === T.band_pairs;
+        t.band_coverage === T.band_coverage && t.band_pairs === T.band_pairs &&
+        mine.slope === D.size_slope && mine.center === D.size_center;
       if (match) {
-        for (var i = 0; i < T.grid.length; i++) if (mine.test.grid[i].error !== T.grid[i].error || mine.test.grid[i].k !== T.grid[i].k) { match = false; break; }
+        for (var i = 0; i < T.grid.length; i++) if (mine.test.grid[i].error !== T.grid[i].error || mine.test.grid[i].k !== T.grid[i].k || mine.test.grid[i].lambda !== T.grid[i].lambda) { match = false; break; }
+      }
+      if (match) {
+        for (var j = 0; j < D.multiples.length; j++) {
+          var cmJ = D.multiples[j];
+          if (!mine.multiples[cmJ.category] || mine.multiples[cmJ.category].log_intercept !== cmJ.log_intercept) { match = false; break; }
+        }
       }
     }
-    var grid = T.grid.map(function (g) { return 'k=' + g.k + ' → ' + g.error.toFixed(4); }).join(' · ');
+    var grid = T.grid.map(function (g) { return 'k=' + g.k + ', λ=' + g.lambda + ' → ' + g.error.toFixed(4); }).join(' · ');
     var rowsN1 = D.rows.filter(function (r) { return r.model.category_sample === 1; }).length;
     var rowsN0 = D.rows.filter(function (r) { return r.model.category_sample === 0; }).length;
     var weight1 = Math.round((1 / (1 + T.fit_k)) * 100);
     return '' +
       '<section class="model-strip test"><h2>Model test — fitted, then tested held-out, twice</h2>' +
-      '<p>The ' + T.peers + ' tokened peers with a market cap and a TVL are split in two by a hash of their slugs; the model is fitted on one half and scored on the other, then the halves swap — <b>two-way holdout</b> — and k is the one with the lowest pooled median |log error|: <span class="testgrid">' + grid + '</span>. Winner: <b>k = ' + T.fit_k + '</b>, median held-out error <b>' + T.median_abs_log_error.toFixed(4) + '</b> in log space (×' + Math.exp(T.median_abs_log_error).toFixed(1) + ' typical miss on a single launch — launches vary; that is the honest number), A→B <b>' + T.err_fit_a_test_b.toFixed(4) + '</b>, B→A <b>' + T.err_fit_b_test_a.toFixed(4) + '</b>.</p>' +
-      '<p>The <b>range</b> under every value is calibrated from the same holdout: each category\'s multiple fitted on one half is compared with its fit on the other half — ' + T.band_pairs + ' category pairs, 75th-percentile log difference <b>' + T.band_half_width.toFixed(4) + '</b> (×' + Math.exp(T.band_half_width).toFixed(2) + '), <b>' + Math.round(T.band_coverage * 100) + '%</b> of split-half fits inside the band. Thin evidence is priced, not hidden: <b>' + rowsN1 + ' rows</b> sit in categories with a single tokened peer — at k = ' + T.fit_k + ' that peer carries ' + weight1 + '% of the multiple, the global fit the rest — and <b>' + rowsN0 + ' rows</b> sit in categories with no tokened peer at all, priced from the global fit alone (grade D).</p>' +
+      '<p>The ' + T.peers + ' tokened peers with a market cap and a TVL are split in two by a hash of their slugs; the model is fitted on one half and scored on the other, then the halves swap — <b>two-way holdout</b> — and the (k, λ) pair with the lowest pooled median |log error| wins: <span class="testgrid">' + grid + '</span>. Winner: <b>k = ' + T.fit_k + ', λ = ' + T.fit_lambda + '</b>, median held-out error <b>' + T.median_abs_log_error.toFixed(4) + '</b> in log space (×' + Math.exp(T.median_abs_log_error).toFixed(1) + ' typical miss on a single launch — launches vary; that is the honest number), A→B <b>' + T.err_fit_a_test_b.toFixed(4) + '</b>, B→A <b>' + T.err_fit_b_test_a.toFixed(4) + '</b>. The fitted size slope is <b>' + D.size_slope.toFixed(4) + '</b>: the peers themselves say a launch\'s multiple falls as its TVL grows, and the curve prices that instead of pretending a $5M protocol and a $5B one deserve the same multiple.</p>' +
+      '<p>The <b>range</b> under every value is calibrated from the same holdout: each category\'s curve fitted on one half is compared with its fit on the other half at that category\'s own typical size — ' + T.band_pairs + ' category pairs, 75th-percentile log difference <b>' + T.band_half_width.toFixed(4) + '</b> (×' + Math.exp(T.band_half_width).toFixed(2) + '), <b>' + Math.round(T.band_coverage * 100) + '%</b> of split-half fits inside the band. Thin evidence is priced, not hidden: <b>' + rowsN1 + ' rows</b> sit in categories with a single tokened peer — at k = ' + T.fit_k + ' that peer carries ' + weight1 + '% of the intercept, the global fit the rest — and <b>' + rowsN0 + ' rows</b> sit in categories with no tokened peer at all, priced from the global fit alone (grade D).</p>' +
       '<p>' + (match
         ? '<span class="up">✓ This page re-ran fitModel() and holdoutTest() on the published peer pool and reproduced every figure above — the fit, both error directions, the band and its coverage.</span>'
         : '<span class="down">This page\'s re-run of the holdout differs from the published figures.</span>') + '</p></section>';
@@ -564,8 +601,11 @@
     var handsOn = Math.round(((25 + 15 * shape.weeks + 35) / 60) * 2) / 2;
     var steps = farmStepsForRow(r).map(function (s) { return '<li>' + esc(s) + '</li>'; }).join('');
     var fitLine = cm && cm.basis === 'peers'
-      ? 'fitted from ' + cm.sample + ' tokened peer' + (cm.sample === 1 ? '' : 's') + ' — peer weight ' + Math.round(cm.shrink_weight * 100) + '%, global fit the rest (k = ' + D.model_test.fit_k + ')'
-      : 'no tokened peers in this category — the global fit, unshrunk';
+      ? 'fitted from ' + cm.sample + ' tokened peer' + (cm.sample === 1 ? '' : 's') + ' on the size curve — peer weight ' + Math.round(cm.shrink_weight * 100) + '%, global fit the rest (k = ' + D.model_test.fit_k + ', slope ' + D.size_slope.toFixed(4) + ')'
+      : 'no tokened peers in this category — the global fit on the size curve, unshrunk';
+    var bandF = Math.exp(D.model_test.band_half_width);
+    var mLo = Math.max(D.model.clamp_lo, Math.min(D.model.clamp_hi, r.model.category_multiple / bandF));
+    var mHi = Math.max(D.model.clamp_lo, Math.min(D.model.clamp_hi, r.model.category_multiple * bandF));
     app.innerHTML = header('board') +
       '<a class="back" href="#/">← Back to the ranked board</a>' +
       '<div class="detail-head"><h2>' + esc(r.name) + '</h2>' +
@@ -576,9 +616,9 @@
       '<div class="detail-grid">' +
       '<div class="card"><h3>What the model says</h3><table class="kv">' +
       '<tr><td class="k">TVL (snapshot)</td><td class="v">' + fmtFull(r.tvl_usd) + '</td></tr>' +
-      '<tr><td class="k">Category multiple — ' + esc(r.category || 'Uncategorised') + '</td><td class="v">×' + r.model.category_multiple.toFixed(4) + '</td></tr>' +
+      '<tr><td class="k">Category multiple at this size — ' + esc(r.category || 'Uncategorised') + '</td><td class="v">×' + r.model.category_multiple.toFixed(4) + '</td></tr>' +
       '<tr><td class="k">— ' + esc(fitLine) + '</td><td class="v">' + (cm && cm.peer_median !== null ? 'peer median ×' + cm.peer_median.toFixed(4) : 'global ×' + D.global_median.toFixed(4)) + '</td></tr>' +
-      '<tr><td class="k">— range band (split-half holdout, ±×' + Math.exp(D.model_test.band_half_width).toFixed(2) + ')</td><td class="v">×' + (cm ? cm.multiple_low.toFixed(3) : 'n/a') + ' – ×' + (cm ? cm.multiple_high.toFixed(3) : 'n/a') + '</td></tr>' +
+      '<tr><td class="k">— range band (split-half holdout, ±×' + Math.exp(D.model_test.band_half_width).toFixed(2) + ')</td><td class="v">×' + mLo.toFixed(3) + ' – ×' + mHi.toFixed(3) + '</td></tr>' +
       '<tr><td class="k">Base (TVL × multiple)</td><td class="v">' + fmtFull(base) + '</td></tr>' +
       '<tr><td class="k">Momentum (7d ' + fmtPct(r.change_7d) + ')</td><td class="v">×' + r.model.momentum_multiplier.toFixed(4) + '</td></tr>' +
       '<tr><td class="k">Maturity (age ' + fmtAge(r.age_days) + (r.listed_at ? ', listed ' + esc(r.listed_at) : ', listing date unknown') + ')</td><td class="v">×' + r.model.maturity_multiplier.toFixed(4) + '</td></tr>' +

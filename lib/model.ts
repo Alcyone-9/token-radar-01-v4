@@ -1,4 +1,4 @@
-// Token radar — Raphael's model, version 3. One snapshot of the protocol universe in, one
+// Token radar — Raphael's model, version 4. One snapshot of the protocol universe in, one
 // ranked board out.
 //
 // THE SEPARATION COMES FIRST. Of the snapshot's protocols, three sets are told apart before
@@ -14,29 +14,39 @@
 //   - launch candidates: the rest of the no-token protocols. These the board ranks, the
 //     40-protocol watchlist among them (the floor, never the ceiling).
 //
-// THE MODEL, VERSION 3. Version 2 priced candidates from shrunk category medians that were
-// never fitted and never tested out of sample. Version 3 fits and tests, in the open:
+// THE MODEL, VERSION 4. Version 2 priced candidates from shrunk category medians that were
+// never fitted and never tested out of sample. Version 3 fitted a multiple per category
+// and tested it held-out — but it priced a $5M lending market and a $5B one at the same
+// multiple, while the snapshot's own peers say size is systematic: across the 128 tokened
+// peers, log multiple falls with log TVL at slope ≈ −0.45 (correlation −0.42). Version 4
+// fits the size curve as well as the category:
 //
-//   fit      — for each category, a multiple is fitted to the snapshot's own tokened peers
-//              in log space: the fitted log-multiple is the peers' mean log ratio, pulled
-//              toward the global fitted log-multiple with strength k (the pull is
-//              n/(n+k) peer weight). Peer ratios are winsorized at the field's 95th
-//              percentile first, so one absurd peer cannot carry a category, and every
-//              fitted multiple is clamped to [0.02, 5].
-//   holdout  — k itself is chosen by a two-way holdout on the peer pool: the peers are
-//              split in two deterministic halves (by a hash of the slug, never by clock or
-//              chance), the model is fitted on one half and scored on the other, then the
-//              halves swap. The k with the lowest pooled median |log error| wins, the model
-//              is refitted on all peers with that k, and the test's numbers — the median
-//              held-out error in each direction, the error band and its coverage — are
-//              published with the board, not kept in a drawer.
+//   fit      — for each category, a log-intercept is fitted to the snapshot's own tokened
+//              peers: the peers' mean log ratio, pulled toward the global fitted log
+//              intercept with strength k (the pull is n/(n+k) peer weight). On top of the
+//              intercepts, one global size slope is fitted: log multiple changes by the
+//              slope for each e-fold of TVL away from the peer pool's centre size, the
+//              slope itself ridge-pulled with strength λ so a thin pool cannot invent a
+//              steep curve. Intercepts and slope are fitted together by backfitting
+//              (25 fixed passes, so every run — and the dashboard's re-run — lands on the
+//              same numbers). Peer ratios are winsorized at the field's 95th percentile
+//              first, so one absurd peer cannot carry a category, and every fitted
+//              multiple is clamped to [0.02, 5].
+//   holdout  — (k, λ) are chosen together by a two-way holdout on the peer pool: the peers
+//              are split in two deterministic halves (by a hash of the slug, never by
+//              clock or chance), the model is fitted on one half and scored on the other,
+//              then the halves swap. The pair with the lowest pooled median |log error|
+//              wins, the model is refitted on all peers with that pair, and the test's
+//              numbers — the median held-out error in each direction, the error band and
+//              its coverage — are published with the board, not kept in a drawer.
 //   range    — the low/high under each value is the fitted multiple widened by the model's
-//              own measured error band: in the same holdout, each category's multiple is
-//              fitted on one half and compared with its fit on the other half, and the
-//              75th percentile of those split-half log differences is the band. A range is
-//              a measured miss distance of the estimate itself, not a decoration. (The
-//              panel also publishes the wider peer-level error: how far a single launch
-//              typically lands from its category's multiple.)
+//              own measured error band: in the same holdout, each category's fitted curve
+//              on one half is compared with its fit on the other half at that category's
+//              own typical size, and the 75th percentile of those split-half log
+//              differences is the band. A range is a measured miss distance of the
+//              estimate itself, not a decoration. (The panel also publishes the wider
+//              peer-level error: how far a single launch typically lands from its
+//              category's curve.)
 //   thin     — a category with one tokened peer prices its rows mostly from the global fit
 //              (the peer's weight is 1/(1+k)) and the row says so; a category with no
 //              tokened peer is priced from the global fit alone and graded D. No row hides
@@ -126,26 +136,34 @@ export const MODEL: ModelConstants = {
   verdict_floor_thin_div: 20,
 };
 
-export const MODEL_VERSION = 'radar-raphael-3';
+export const MODEL_VERSION = 'radar-raphael-4';
 
 /** The shrinkage strengths the holdout chooses between: small k trusts each category, large k trusts the field. */
 export const FIT_GRID_K = [2, 4, 6, 10, 16, 24, 40];
 
+/** The slope ridges the holdout chooses between: how hard the size slope is pulled toward flat. */
+export const FIT_GRID_LAMBDA = [0, 8, 32];
+
+/** Backfitting passes for the joint intercept/slope fit: fixed, so every run lands on the same fit. */
+export const SIZE_FIT_ITERATIONS = 25;
+
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 30;
 
-/** One tokened peer observation the fit runs on: its category and its market-cap/TVL ratio. */
+/** One tokened peer observation the fit runs on: its category, its market-cap/TVL ratio, and its TVL (the size the curve is fitted over). */
 export interface PeerObs {
   slug: string;
   category: string;
   ratio: number;
+  tvl: number;
 }
 
 /** The holdout's published result: how the fitted model did on peers it was not fitted on. */
 export interface ModelTest {
   fit_k: number;
+  fit_lambda: number;
   peers: number;
-  grid: { k: number; error: number }[];
+  grid: { k: number; lambda: number; error: number }[];
   err_fit_a_test_b: number;
   err_fit_b_test_a: number;
   median_abs_log_error: number;
@@ -154,13 +172,14 @@ export interface ModelTest {
   band_pairs: number;
 }
 
-/** One category's fitted multiple: what the fit produced, and how much of it is the category's own peers. */
+/** One category's fitted curve: its log-intercept at the pool's centre size, and the multiple that intercept gives at that size. */
 export interface CategoryMultiple {
   category: string;
   sample: number;
   peer_median: number | null;
   peer_q1: number | null;
   peer_q3: number | null;
+  log_intercept: number;
   multiple: number;
   multiple_low: number;
   multiple_high: number;
@@ -271,6 +290,8 @@ export interface RadarData {
   model_version: string;
   global_median: number;
   winsor_cap: number;
+  size_slope: number;
+  size_center: number;
   model_test: ModelTest;
   multiples: CategoryMultiple[];
   peer_pool: PeerObs[];
@@ -384,92 +405,138 @@ export function peerPool(snapshot: Snapshot): PeerObs[] {
   const pool: PeerObs[] = [];
   for (const p of snapshot.protocols) {
     if (isPreToken(p) || p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
-    pool.push({ slug: p.slug, category: p.category ?? '', ratio: round4(p.mcap_usd / p.tvl_usd) });
+    pool.push({ slug: p.slug, category: p.category ?? '', ratio: round4(p.mcap_usd / p.tvl_usd), tvl: p.tvl_usd });
   }
   return pool.sort((a, b) => a.slug.localeCompare(b.slug));
 }
 
-interface Fitted {
-  global: number;
-  byCategory: Map<string, number>;
-}
-
 /**
- * Fit the multiples on one set of peer observations: winsorize the ratios at the pool's 95th
- * percentile, take the global fit as the mean log ratio outside the product categories, and
- * pull each category's mean log ratio toward it with strength k. A category absent from the
- * set gets no entry — its peers are predicted from the global fit, which is exactly the
- * honesty the holdout measures.
+ * One fitted size curve: per-category log-intercepts at the fit's centre size (the train
+ * pool's mean log TVL), the global log-intercept, and the one size slope shared by every
+ * category — log multiple = intercept + slope x (log TVL - centre).
  */
-function fitOn(pool: PeerObs[], winsorCap: number, k: number, model: ModelConstants): Fitted {
-  const clampM = (n: number): number => Math.min(model.clamp_hi, Math.max(model.clamp_lo, n));
-  const globalLogs: number[] = [];
-  const byCategory = new Map<string, number[]>();
-  for (const x of pool) {
-    const logRatio = Math.log(Math.min(x.ratio, winsorCap));
-    if (!PRODUCT_CATEGORIES.has(x.category)) globalLogs.push(logRatio);
-    const list = byCategory.get(x.category) ?? [];
-    list.push(logRatio);
-    byCategory.set(x.category, list);
-  }
-  const globalLog = globalLogs.length > 0 ? globalLogs.reduce((s, v) => s + v, 0) / globalLogs.length : Math.log(0.2);
-  const fitted = new Map<string, number>();
-  for (const [category, logs] of byCategory) {
-    const mean = logs.reduce((s, v) => s + v, 0) / logs.length;
-    fitted.set(category, clampM(Math.exp((logs.length * mean + k * globalLog) / (logs.length + k))));
-  }
-  return { global: clampM(Math.exp(globalLog)), byCategory: fitted };
-}
-
-/** What one fitted model predicts for a peer: its category's fit, or the global fit when the category is absent. */
-function predict(fit: Fitted, category: string): number {
-  return fit.byCategory.get(category) ?? fit.global;
+interface Fitted {
+  globalLog: number;
+  byCategory: Map<string, number>;
+  slope: number;
+  center: number;
 }
 
 /**
- * The two-way holdout. The peer pool is split by slug-hash parity; for each candidate k the
- * model is fitted on one half and scored on the other, then the halves swap, and the pooled
- * median |log error| decides. Two errors are published, for two different questions: the
- * peer-level error (how far one launch typically lands from its category's multiple — wide,
- * because launches vary) and the range band, calibrated from the split-half stability of
- * the multiples themselves: at the winning k, each category fitted on one half is compared
- * with its fit on the other half, and the 75th percentile of those log differences is the
- * half-width every row's range is widened by. The coverage is the share of split-half fits
- * that fell inside that band around their other-half fit. A pool too small to pair any
- * category falls back to the peer-level band, and band_pairs says which happened.
+ * Fit the curve on one set of peer observations: winsorize the ratios at the pool's 95th
+ * percentile, then backfit — each pass refits the shrunk category intercepts on the
+ * slope-adjusted log ratios (the global intercept is the mean log ratio outside the
+ * product categories, as in version 3) and refits the slope on the intercept-adjusted
+ * residuals with ridge strength lambda. A category absent from the set gets no entry —
+ * its peers are predicted from the global intercept on the same curve, which is exactly
+ * the honesty the holdout measures.
+ */
+function fitOn(pool: PeerObs[], winsorCap: number, k: number, lambda: number, model: ModelConstants): Fitted {
+  const center = pool.length > 0 ? pool.reduce((s, x) => s + Math.log(x.tvl), 0) / pool.length : 0;
+  const logRatio = (x: PeerObs): number => Math.log(Math.min(x.ratio, winsorCap));
+  let slope = 0;
+  let globalLog = Math.log(0.2);
+  let byCategory = new Map<string, number>();
+  for (let it = 0; it < SIZE_FIT_ITERATIONS; it++) {
+    const globalLogs: number[] = [];
+    const byCat = new Map<string, number[]>();
+    for (const x of pool) {
+      const adj = logRatio(x) - slope * (Math.log(x.tvl) - center);
+      if (!PRODUCT_CATEGORIES.has(x.category)) globalLogs.push(adj);
+      const list = byCat.get(x.category) ?? [];
+      list.push(adj);
+      byCat.set(x.category, list);
+    }
+    globalLog = globalLogs.length > 0 ? globalLogs.reduce((s, v) => s + v, 0) / globalLogs.length : Math.log(0.2);
+    byCategory = new Map<string, number>();
+    for (const [category, logs] of byCat) {
+      const mean = logs.reduce((s, v) => s + v, 0) / logs.length;
+      byCategory.set(category, (logs.length * mean + k * globalLog) / (logs.length + k));
+    }
+    let num = 0;
+    let den = lambda;
+    for (const x of pool) {
+      const z = Math.log(x.tvl) - center;
+      num += z * (logRatio(x) - (byCategory.get(x.category) ?? globalLog));
+      den += z * z;
+    }
+    slope = den > 0 ? num / den : 0;
+  }
+  return { globalLog, byCategory, slope, center };
+}
+
+/** The fitted log multiple for a category at size z (a log TVL): its intercept on the curve, or the global intercept. */
+function predictLogAtZ(fit: Fitted, category: string, z: number): number {
+  return (fit.byCategory.get(category) ?? fit.globalLog) + fit.slope * (z - fit.center);
+}
+
+/** What one fitted curve predicts for a peer: its category's curve at the peer's own size, clamped like every fit. */
+function predict(fit: Fitted, x: PeerObs, model: ModelConstants): number {
+  return Math.min(model.clamp_hi, Math.max(model.clamp_lo, Math.exp(predictLogAtZ(fit, x.category, Math.log(x.tvl)))));
+}
+
+/**
+ * The two-way holdout. The peer pool is split by slug-hash parity; for each candidate
+ * (k, lambda) pair the curve is fitted on one half and scored on the other, then the
+ * halves swap, and the pooled median |log error| decides. Two errors are published, for
+ * two different questions: the peer-level error (how far one launch typically lands from
+ * its category's curve — wide, because launches vary) and the range band, calibrated from
+ * the split-half stability of the curves themselves: at the winning pair, each category
+ * fitted on one half is compared with its fit on the other half at that category's own
+ * typical size (its peers' mean log TVL over the whole pool), and the 75th percentile of
+ * those log differences is the half-width every row's range is widened by. The coverage
+ * is the share of split-half fits that fell inside that band around their other-half fit.
+ * A pool too small to pair any category falls back to the peer-level band, and band_pairs
+ * says which happened.
  */
 export function holdoutTest(pool: PeerObs[], model: ModelConstants = MODEL): { test: ModelTest; winsorCap: number } {
   const ratios = sortedCopy(pool.map((x) => x.ratio));
   const winsorCap = ratios.length > 0 ? quantile(ratios, model.winsor_p) : 1;
   const halfA = pool.filter((x) => slugHash(x.slug) % 2 === 0);
   const halfB = pool.filter((x) => slugHash(x.slug) % 2 === 1);
-  const residualsFor = (k: number): { ab: number[]; ba: number[] } => {
-    const fitA = fitOn(halfA, winsorCap, k, model);
-    const fitB = fitOn(halfB, winsorCap, k, model);
-    const ab = halfB.map((x) => Math.log(Math.min(x.ratio, winsorCap)) - Math.log(predict(fitA, x.category)));
-    const ba = halfA.map((x) => Math.log(Math.min(x.ratio, winsorCap)) - Math.log(predict(fitB, x.category)));
+  const residualsFor = (k: number, lambda: number): { ab: number[]; ba: number[] } => {
+    const fitA = fitOn(halfA, winsorCap, k, lambda, model);
+    const fitB = fitOn(halfB, winsorCap, k, lambda, model);
+    const ab = halfB.map((x) => Math.log(Math.min(x.ratio, winsorCap)) - Math.log(predict(fitA, x, model)));
+    const ba = halfA.map((x) => Math.log(Math.min(x.ratio, winsorCap)) - Math.log(predict(fitB, x, model)));
     return { ab, ba };
   };
   let bestK = FIT_GRID_K[0]!;
+  let bestLambda = FIT_GRID_LAMBDA[0]!;
   let bestError = Number.POSITIVE_INFINITY;
-  const grid: { k: number; error: number }[] = [];
+  const grid: { k: number; lambda: number; error: number }[] = [];
   for (const k of FIT_GRID_K) {
-    const { ab, ba } = residualsFor(k);
-    const error = median([...ab, ...ba].map(Math.abs));
-    grid.push({ k, error: round4(error) });
-    if (error < bestError) {
-      bestError = error;
-      bestK = k;
+    for (const lambda of FIT_GRID_LAMBDA) {
+      const { ab, ba } = residualsFor(k, lambda);
+      const error = median([...ab, ...ba].map(Math.abs));
+      grid.push({ k, lambda, error: round4(error) });
+      if (error < bestError) {
+        bestError = error;
+        bestK = k;
+        bestLambda = lambda;
+      }
     }
   }
-  const { ab, ba } = residualsFor(bestK);
+  const { ab, ba } = residualsFor(bestK, bestLambda);
   const absPooled = [...ab, ...ba].map(Math.abs);
-  const fitA = fitOn(halfA, winsorCap, bestK, model);
-  const fitB = fitOn(halfB, winsorCap, bestK, model);
+  const fitA = fitOn(halfA, winsorCap, bestK, bestLambda, model);
+  const fitB = fitOn(halfB, winsorCap, bestK, bestLambda, model);
+  const catMeanZ = new Map<string, number>();
+  {
+    const sums = new Map<string, { sum: number; n: number }>();
+    for (const x of pool) {
+      const s = sums.get(x.category) ?? { sum: 0, n: 0 };
+      s.sum += Math.log(x.tvl);
+      s.n += 1;
+      sums.set(x.category, s);
+    }
+    for (const [category, s] of sums) catMeanZ.set(category, s.sum / s.n);
+  }
   const stability: number[] = [];
-  for (const [category, mA] of fitA.byCategory) {
-    const mB = fitB.byCategory.get(category);
-    if (mB !== undefined) stability.push(Math.abs(Math.log(mA) - Math.log(mB)));
+  for (const [category] of fitA.byCategory) {
+    if (!fitB.byCategory.has(category)) continue;
+    const z = catMeanZ.get(category) ?? fitA.center;
+    stability.push(Math.abs(predictLogAtZ(fitA, category, z) - predictLogAtZ(fitB, category, z)));
   }
   const bandSource = stability.length > 0 ? stability : sortedCopy(absPooled);
   const band = quantile(sortedCopy(bandSource), 0.75);
@@ -478,6 +545,7 @@ export function holdoutTest(pool: PeerObs[], model: ModelConstants = MODEL): { t
     winsorCap: round4(winsorCap),
     test: {
       fit_k: bestK,
+      fit_lambda: bestLambda,
       peers: pool.length,
       grid,
       err_fit_a_test_b: round4(median(ab.map(Math.abs))),
@@ -491,19 +559,25 @@ export function holdoutTest(pool: PeerObs[], model: ModelConstants = MODEL): { t
 }
 
 /**
- * The category multiples, fitted on the snapshot itself and widened by the holdout's error
- * band. Categories with no tokened peer take the global fit and say so (basis 'global',
+ * The category curves, fitted on the snapshot itself and widened by the holdout's error
+ * band. Each category publishes its log-intercept (rounded once, here, so the dashboard
+ * prices rows from the identical numbers) and the multiple that intercept gives at the
+ * pool's centre size; a row's own multiple is read off the curve at the row's own size.
+ * Categories with no tokened peer take the global intercept and say so (basis 'global',
  * shrink weight 0); a category with one peer leans on the global fit for k/(1+k) of its
- * value, and its shrink weight shows exactly that.
+ * intercept, and its shrink weight shows exactly that.
  */
 export function categoryMultiples(
   snapshot: Snapshot,
   model: ModelConstants = MODEL,
-): { globalMedian: number; winsorCap: number; multiples: CategoryMultiple[]; test: ModelTest; pool: PeerObs[] } {
+): { globalMedian: number; winsorCap: number; multiples: CategoryMultiple[]; test: ModelTest; pool: PeerObs[]; sizeSlope: number; sizeCenter: number } {
   const pool = peerPool(snapshot);
   const { test, winsorCap } = holdoutTest(pool, model);
-  const fit = fitOn(pool, winsorCap, test.fit_k, model);
+  const fit = fitOn(pool, winsorCap, test.fit_k, test.fit_lambda, model);
   const clampM = (n: number): number => Math.min(model.clamp_hi, Math.max(model.clamp_lo, n));
+  const sizeSlope = round4(fit.slope);
+  const sizeCenter = round4(fit.center);
+  const globalLogIntercept = round4(fit.globalLog);
   const cappedByCategory = new Map<string, number[]>();
   for (const x of pool) {
     const list = cappedByCategory.get(x.category) ?? [];
@@ -516,35 +590,23 @@ export function categoryMultiples(
   const multiples: CategoryMultiple[] = [...categories].sort().map((category) => {
     const ratios = sortedCopy(cappedByCategory.get(category) ?? []);
     const n = ratios.length;
-    if (n === 0) {
-      return {
-        category,
-        sample: 0,
-        peer_median: null,
-        peer_q1: null,
-        peer_q3: null,
-        multiple: round4(fit.global),
-        multiple_low: round4(clampM(fit.global * Math.exp(-band))),
-        multiple_high: round4(clampM(fit.global * Math.exp(band))),
-        basis: 'global' as const,
-        shrink_weight: 0,
-      };
-    }
-    const m = fit.byCategory.get(category) ?? fit.global;
+    const logIntercept = n === 0 ? globalLogIntercept : round4(fit.byCategory.get(category) ?? fit.globalLog);
+    const m = clampM(Math.exp(logIntercept));
     return {
       category,
       sample: n,
-      peer_median: round4(median(ratios)),
-      peer_q1: round4(quantile(ratios, 0.25)),
-      peer_q3: round4(quantile(ratios, 0.75)),
+      peer_median: n === 0 ? null : round4(median(ratios)),
+      peer_q1: n === 0 ? null : round4(quantile(ratios, 0.25)),
+      peer_q3: n === 0 ? null : round4(quantile(ratios, 0.75)),
+      log_intercept: logIntercept,
       multiple: round4(m),
       multiple_low: round4(clampM(Math.min(m, m * Math.exp(-band)))),
       multiple_high: round4(clampM(Math.max(m, m * Math.exp(band)))),
-      basis: 'peers' as const,
-      shrink_weight: round4(n / (n + test.fit_k)),
+      basis: n === 0 ? ('global' as const) : ('peers' as const),
+      shrink_weight: n === 0 ? 0 : round4(n / (n + test.fit_k)),
     };
   });
-  return { globalMedian: round4(fit.global), winsorCap, multiples, test, pool };
+  return { globalMedian: round4(clampM(Math.exp(globalLogIntercept))), winsorCap, multiples, test, pool, sizeSlope, sizeCenter };
 }
 
 /** The age band a protocol's cohort is read in: the launch record is kept apart by how long a protocol has lived. */
@@ -630,13 +692,16 @@ export function verdictFor(expectedValue: number, odds: number, floorUsd: number
   return 'farm';
 }
 
-/** The model's factors for one protocol, and the implied value and range they produce. */
+/** The model's factors for one protocol, and the implied value and range they produce. The multiple is read off the category's fitted size curve at the protocol's own TVL, from the published (rounded) intercept, slope and centre — the identical numbers the dashboard prices from. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
   cm: CategoryMultiple,
+  size: { slope: number; center: number },
+  band: number,
   model: ModelConstants = MODEL,
-): { implied: number; impliedLow: number; impliedHigh: number; momentumMult: number; maturityMult: number; chainMult: number; age: number | null } {
+): { implied: number; impliedLow: number; impliedHigh: number; momentumMult: number; maturityMult: number; chainMult: number; age: number | null; multiple: number } {
+  const clampM = (n: number): number => Math.min(model.clamp_hi, Math.max(model.clamp_lo, n));
   const age = ageDays(asOf, protocol.listed_at);
   const growth = finite(protocol.change_7d, 0);
   const clamped = Math.min(model.momentum_cap, Math.max(model.momentum_floor, growth));
@@ -644,15 +709,17 @@ export function impliedValue(
   const ageForModel = age ?? model.unknown_age_days;
   const maturityMult = round4(model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range);
   const chainMult = protocol.chains.length >= 3 ? model.chain_3plus : protocol.chains.length === 2 ? model.chain_2 : 1;
-  const at = (multiple: number): number => Math.max(1, Math.round(protocol.tvl_usd * multiple * momentumMult * maturityMult * chainMult));
+  const multiple = clampM(Math.exp(cm.log_intercept + size.slope * (Math.log(protocol.tvl_usd) - size.center)));
+  const at = (m: number): number => Math.max(1, Math.round(protocol.tvl_usd * m * momentumMult * maturityMult * chainMult));
   return {
-    implied: at(cm.multiple),
-    impliedLow: at(cm.multiple_low),
-    impliedHigh: at(cm.multiple_high),
+    implied: at(multiple),
+    impliedLow: at(clampM(multiple * Math.exp(-band))),
+    impliedHigh: at(clampM(multiple * Math.exp(band))),
     momentumMult,
     maturityMult,
     chainMult,
     age,
+    multiple,
   };
 }
 
@@ -820,14 +887,15 @@ export function farmSteps(
 
 /** The ranked board: every launch candidate, by implied value, each with its odds, expected value and verdict. */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
-  const { multiples } = categoryMultiples(snapshot, model);
+  const { multiples, test, sizeSlope, sizeCenter } = categoryMultiples(snapshot, model);
   const { cohorts } = cohortStats(snapshot, model);
   const byCategory = new Map(multiples.map((m) => [m.category, m]));
+  const size = { slope: sizeSlope, center: sizeCenter };
   const rows: BoardRow[] = snapshot.protocols
     .filter(isRankable)
     .map((p) => {
       const cm = byCategory.get(p.category ?? '')!;
-      const v = impliedValue(p, snapshot.as_of, cm, model);
+      const v = impliedValue(p, snapshot.as_of, cm, size, test.band_half_width, model);
       const shape = planShape(p, v.age);
       const cohort = cohorts[cohortKey(p.category ?? '', v.age, p.tvl_usd)];
       const odds = cohort ? cohort.odds : 0;
@@ -855,7 +923,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
         verdict,
         confidence: confidenceFor(cm.sample),
         model: {
-          category_multiple: cm.multiple,
+          category_multiple: round4(v.multiple),
           category_sample: cm.sample,
           momentum_multiplier: v.momentumMult,
           maturity_multiplier: v.maturityMult,
@@ -955,9 +1023,9 @@ export function peersByCategory(snapshot: Snapshot): Record<string, PeerRow[]> {
   return out;
 }
 
-/** The full radar: board, live view, set-aside view, the fitted multiples, the holdout and the odds. */
+/** The full radar: board, live view, set-aside view, the fitted curves, the holdout and the odds. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): RadarData {
-  const { globalMedian, winsorCap, multiples, test, pool } = categoryMultiples(snapshot, model);
+  const { globalMedian, winsorCap, multiples, test, pool, sizeSlope, sizeCenter } = categoryMultiples(snapshot, model);
   const { cohorts, globalRate } = cohortStats(snapshot, model);
   const board = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
@@ -970,6 +1038,8 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): R
     model_version: MODEL_VERSION,
     global_median: globalMedian,
     winsor_cap: winsorCap,
+    size_slope: sizeSlope,
+    size_center: sizeCenter,
     model_test: test,
     multiples,
     peer_pool: pool,
